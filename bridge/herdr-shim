@@ -1,0 +1,7 @@
+#!/bin/sh
+# herdr 0.9.3 forwarder (NOT on Windows PATH, so PowerShell/cmd never see
+# it): satisfies the phone app's explicit-path probes ($HOME/bin/herdr),
+# which otherwise fall through to a stale protocol-20 standalone copy.
+# NOTE: points at the real release dir, NOT AppData\...\Herdr\bin (a junction
+# the sshd token cannot traverse).
+exec "$HOME/.herdr/packages/standalone/releases/0.9.3-x86_64-pc-windows-msvc/herdr.exe" "$@"

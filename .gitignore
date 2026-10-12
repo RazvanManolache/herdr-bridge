@@ -1,0 +1,24 @@
+# Runtime outputs — never commit these.
+*.log
+snapshot-cache.json
+idempotency.json
+__pycache__/
+*.exe
+*.out
+*.err
+build/
+commands.sqlite3*
+
+# Local backups and credentials must stay outside published source.
+backups/
+.herdr-bridge-emu/
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*.log.*
+
+# Unused local experiment containing a machine-specific socket path.
+/keeper/sock-keeper.c
