@@ -61,6 +61,11 @@ own input. A request expires after three minutes; five wrong code attempts lock
 it. Closing the console denies pending requests and closes pairing. Existing
 approved devices continue to connect without reopening pairing.
 
+Authenticated idle streams remain open without a one-minute expiry. Started
+frames still have a deadline, stalled writes are bounded, and the authorization
+guard continues to close revoked devices. Herdr on the Go 0.2.1 sends read-only
+keep-alives and automatically reconnects after temporary network interruptions.
+
 ## Revoke a phone
 
 In the Pair devices tab, type `devices`, then `revoke DEVICE_ID` for the chosen

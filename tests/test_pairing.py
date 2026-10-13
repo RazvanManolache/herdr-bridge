@@ -10,12 +10,47 @@ import ssl
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bridge'))
 from pairing_store import PairingStore
 import paired_server
+
+
+class SocketLinesTests(unittest.TestCase):
+    def reader(self, chunks, authenticated=False):
+        class Socket:
+            def recv(self, _limit):
+                item = next(chunks)
+                if isinstance(item, Exception): raise item
+                return item
+        reader = paired_server.SocketLines(Socket())
+        reader.allow_idle = authenticated
+        return reader
+
+    def test_authenticated_idle_timeout_keeps_stream_readable(self):
+        reader = self.reader(iter([socket.timeout(), socket.timeout(), b'{"sessionId":"fixture"}\n']), True)
+        self.assertEqual('fixture', paired_server.read_message(reader)['sessionId'])
+
+    def test_initial_handshake_timeout_still_closes(self):
+        with self.assertRaises(socket.timeout):
+            paired_server.read_message(self.reader(iter([socket.timeout()])))
+
+    def test_partial_frame_timeout_is_not_ignored(self):
+        with self.assertRaises(socket.timeout):
+            paired_server.read_message(self.reader(iter([b'{', socket.timeout()]), True))
+
+    def test_coalesced_frames_are_preserved(self):
+        reader = self.reader(iter([b'{"a":1}\n{"b":2}\n']))
+        self.assertEqual({'a': 1}, paired_server.read_message(reader))
+        self.assertEqual({'b': 2}, paired_server.read_message(reader))
+
+    def test_frame_trickle_has_an_absolute_deadline(self):
+        with patch.object(paired_server.time, 'monotonic', side_effect=[0, 0, 61]):
+            with self.assertRaises(TimeoutError):
+                paired_server.read_message(self.reader(iter([b'{', b' ']), True))
 
 
 class PairingTests(unittest.TestCase):
@@ -143,6 +178,29 @@ class TlsTests(unittest.TestCase):
         with self.assertRaises(RuntimeError): paired_server.identity(self.home)
     def test_certificate_identity_is_stable(self):
         self.assertEqual(self.fingerprint, paired_server.identity(self.home)[2])
+
+    def test_authenticated_idle_stream_survives_one_minute_and_revokes(self):
+        responder = self.home / 'echo.py'
+        responder.write_text('import sys\nfor line in sys.stdin:\n sys.stdout.write(line); sys.stdout.flush()\n')
+        self.server.responder = responder
+        self.store.open_window(); secret = secrets.token_urlsafe(32)
+        request = self.store.start('Idle phone', 'fixture', secret)
+        self.assertTrue(self.store.approve(request['requestId'], request['code']))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
+        with socket.create_connection(self.server.server_address, timeout=3) as raw:
+            with context.wrap_socket(raw, server_hostname='fixture') as tls:
+                self.assertEqual(self.fingerprint, hashlib.sha256(tls.getpeercert(True)).hexdigest())
+                tls.settimeout(8)
+                tls.sendall(json.dumps({'op': 'stdio', 'deviceId': request['requestId'],
+                    'secret': secret, 'session': 'fixture'}).encode() + b'\n')
+                incoming = tls.makefile('rb')
+                self.assertTrue(json.loads(incoming.readline())['ok'])
+                time.sleep(65)  # Real regression against the previous 60-second disconnect.
+                tls.sendall(b'{"sessionId":"fixture","type":"snapshot.get"}\n')
+                self.assertEqual('snapshot.get', json.loads(incoming.readline())['type'])
+                self.store.revoke(request['requestId'])
+                self.assertEqual(b'', incoming.readline())
 
 
 if __name__ == '__main__': unittest.main()

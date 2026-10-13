@@ -11,6 +11,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 
 from bridge_common import HOME, discover_sessions, valid_session
 from pairing_store import PairingStore
@@ -63,6 +64,42 @@ def read_message(stream):
     return value
 
 
+class SocketLines:
+    """Bound each started frame without expiring an authenticated idle stream.
+
+    Use recv directly: a socket.makefile buffer cannot be reused after a timeout.
+    Socket write deadlines remain active for peers that stop reading.
+    """
+    def __init__(self, conn):
+        self.conn, self.buffer = conn, bytearray()
+        self.allow_idle = False
+
+    def readline(self, limit):
+        started = time.monotonic() if self.buffer else None
+        while True:
+            newline = self.buffer.find(b'\n')
+            if newline >= 0:
+                length = min(newline + 1, limit)
+                line = bytes(self.buffer[:length])
+                del self.buffer[:length]
+                return line
+            if len(self.buffer) >= limit:
+                raise ValueError('Oversized frame')
+            if started is not None and time.monotonic() - started >= 60:
+                raise TimeoutError('Incomplete frame')
+            try:
+                chunk = self.conn.recv(min(4096, limit - len(self.buffer)))
+            except socket.timeout:
+                if self.allow_idle and not self.buffer:
+                    continue
+                raise
+            if not chunk:
+                return b''
+            if started is None:
+                started = time.monotonic()
+            self.buffer.extend(chunk)
+
+
 class PairedServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = False
@@ -112,7 +149,8 @@ class PairHandler(socketserver.BaseRequestHandler):
             self.request.settimeout(5)
             conn = self.server.context.wrap_socket(self.request, server_side=True)
             conn.settimeout(10)
-            with conn.makefile('rb') as incoming, conn.makefile('wb') as outgoing:
+            incoming = SocketLines(conn)
+            with conn.makefile('wb') as outgoing:
                 def reply(data):
                     outgoing.write(json.dumps(data, ensure_ascii=True).encode() + b'\n')
                     outgoing.flush()
@@ -151,6 +189,7 @@ class PairHandler(socketserver.BaseRequestHandler):
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
                     conn.settimeout(60)
+                    incoming.allow_idle = True
                     done = threading.Event()
                     def guard():
                         while not done.wait(1):
@@ -176,7 +215,8 @@ class PairHandler(socketserver.BaseRequestHandler):
                             except OSError: pass
                     reply({'ok': True})
                     threading.Thread(target=guard, daemon=True).start()
-                    threading.Thread(target=output, daemon=True).start()
+                    output_thread = threading.Thread(target=output, daemon=True)
+                    output_thread.start()
                     try:
                         while not done.is_set():
                             message = read_message(incoming)
@@ -186,8 +226,13 @@ class PairHandler(socketserver.BaseRequestHandler):
                             proc.stdin.flush()
                     finally:
                         done.set()
+                        try: conn.shutdown(socket.SHUT_RDWR)
+                        except OSError: pass
                         if proc.poll() is None: proc.terminate()
                         proc.wait(timeout=5)
+                        output_thread.join(5)
+                        proc.stdin.close()
+                        proc.stdout.close()
                 finally:
                     self.server.stream_capacity.release()
         except (OSError, ValueError, TypeError, KeyError, RecursionError, subprocess.SubprocessError):
