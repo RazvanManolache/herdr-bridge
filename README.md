@@ -9,6 +9,12 @@ This is an unofficial, single-user adapter using the real Herdr CLI, Windows
 OpenSSH, a small native shell wrapper, and Python's standard library. It
 implements a subset of the mobile bridge protocol.
 
+The current development source also adds an optional **paired TLS connection**:
+approve a phone inside Herdr using its displayed code, without Windows login
+credentials. SSH remains supported. See the [pairing installation and use guide](docs/PAIRING.md).
+The paired-only installer requires no OpenSSH, Git, or C++ build tools.
+Optional dependency terms are recorded in [the notices](THIRD_PARTY_NOTICES.md).
+
 ## Contents
 
 - [Compatibility and prerequisites](#compatibility-and-prerequisites)

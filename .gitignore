@@ -8,6 +8,8 @@ __pycache__/
 *.err
 build/
 commands.sqlite3*
+devices.sqlite3*
+paired/
 
 # Local backups and credentials must stay outside published source.
 backups/

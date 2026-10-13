@@ -1,0 +1,6 @@
+# Optional paired TLS transport. SSH itself still uses the standard library only.
+cryptography==50.0.2
+qrcode==8.2
+cffi==2.1.1
+pycparser==3.11
+colorama==0.4.6
