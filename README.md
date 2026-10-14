@@ -356,9 +356,23 @@ Windows Herdr CLI handles real session control. Despite its historical name,
 `sh-log.exe` streams content without capturing or logging it.
 
 Implemented requests: `hello`, `snapshot.get`, `timeline.subscribe`, `raw.read`,
-`pane.sendText`, `pane.sendKeys`, and `space.close`. Timeline replies preserve
-per-pane batch/delta event shapes. Unsupported requests receive failure replies
-and are not advertised as capabilities.
+`pane.sendText`, `pane.sendKeys`, `pane.fit`, `pane.unfit`, `pane.unfitAll`,
+and `space.close`.
+Timeline replies preserve per-pane batch/delta event shapes. `timeline.subscribe`
+and `raw.read` accept an `ansi` flag for SGR-colored terminal text (plain by
+default). `pane.fit` narrows one single-pane tab to a phone column width with a
+notice panel beside it; `pane.unfit` closes only the panel the bridge opened,
+and `pane.unfitAll` releases every recorded panel at once (fresh attaches sweep
+first so killed clients leave nothing behind). The sweep also closes unrecorded
+panes that print the notice line, keeping one pane per tab. `pane.unfitAll`
+accepts `staleOlderThanMs` to reap only records older than the threshold, and
+`pane.fitTouch` refreshes one record: viewing phones beat every minute while
+the snapshot poller reaps fits unheard from for five minutes, so a killed app
+leaves its panel behind only briefly. Tab lookups read the live layout first
+so fast tab switches record and release the right tab. The notice runs print-then-sleep,
+never a shell.
+Unsupported requests receive failure replies and are not advertised as
+capabilities.
 
 ## Security and retry behavior
 

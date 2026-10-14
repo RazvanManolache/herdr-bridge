@@ -6,12 +6,13 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 
 from bridge_common import (HOME, OutputLimitError, discover_sessions, log,
                            now_ms, run_cli, session_cache, valid_session)
 from command_store import CommandStore
 
-BRIDGE_VERSION = "0.3.1"
+BRIDGE_VERSION = "0.3.2"
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 128 * 1024
 MAX_PANES = 64
@@ -66,12 +67,23 @@ def validate(env):
     payload = env.get("payload", {})
     if not isinstance(payload, dict):
         raise ValueError("payload must be an object")
-    if kind in ("raw.read", "pane.sendText", "pane.send_text", "pane.sendKeys", "pane.send_keys"):
+    if kind in ("raw.read", "pane.sendText", "pane.send_text", "pane.sendKeys", "pane.send_keys",
+                  "pane.fit", "pane.unfit", "pane.fitTouch"):
         target(payload.get("paneId"))
+    if kind == "pane.unfitAll" and "staleOlderThanMs" in payload:
+        stale = payload.get("staleOlderThanMs")
+        if type(stale) is not int or not 60_000 <= stale <= 86_400_000:
+            raise ValueError("staleOlderThanMs must be 60000..86400000")
     if kind == "raw.read":
         lines = payload.get("lines", 1000)
         if type(lines) is not int or not 1 <= lines <= MAX_READ_LINES:
             raise ValueError("lines must be between 1 and 2000")
+        if type(payload.get("ansi", False)) is not bool:
+            raise ValueError("invalid ansi flag")
+    if kind == "pane.fit":
+        cols = payload.get("cols")
+        if type(cols) is not int or not FIT_MIN_COLS <= cols <= FIT_MAX_COLS:
+            raise ValueError("cols must be between 20 and 120")
     if kind == "timeline.subscribe":
         panes = payload.get("paneIds", [])
         if not isinstance(panes, list) or len(panes) > MAX_PANES:
@@ -82,6 +94,8 @@ def validate(env):
             raise ValueError("duplicate panes")
         if type(payload.get("active", False)) is not bool:
             raise ValueError("invalid active flag")
+        if type(payload.get("ansi", False)) is not bool:
+            raise ValueError("invalid ansi flag")
         if payload.get("activePaneId"):
             target(payload["activePaneId"])
     if kind in ("pane.sendText", "pane.send_text"):
@@ -99,7 +113,7 @@ def validate(env):
                 raise ValueError("invalid key")
     if kind in ("space.close", "space_close"):
         target(payload.get("spaceId"))
-    if kind in MUTATIONS:
+    if kind in MUTATIONS or kind in FIT_OPS:
         checked_string(payload.get("idempotencyKey") or request_id, "idempotency key")
     return kind, request_id, payload
 
@@ -111,21 +125,396 @@ def current_snapshot():
     return entry["snapshot"]
 
 
-def require_pane(pane_id):
-    if not any(p.get("pane_id") == pane_id for p in current_snapshot()["panes"]):
+def require_pane(pane_id, must_exist=True):
+    target(pane_id)
+    if must_exist and not any(p.get("pane_id") == pane_id for p in current_snapshot()["panes"]):
         raise ValueError("pane does not belong to selected session")
 
 
-def pane_text(pane_id, lines):
+def pane_text(pane_id, lines, ansi=False):
     require_pane(pane_id)
     try:
         out = run_cli(["--session", SESSION, "pane", "read", pane_id,
                        "--source", "recent-unwrapped", "--lines", str(lines),
-                       "--format", "text"], timeout=12, max_bytes=512 * 1024)
+                       "--format", "ansi" if ansi else "text"], timeout=12, max_bytes=512 * 1024)
         return out.stdout.decode("utf-8", errors="replace") if out.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired, OutputLimitError):
         log("pane_read_failed")
         return ""
+
+
+FIT_MIN_COLS = 20
+FIT_MAX_COLS = 120
+FIT_MIN_RATIO = 0.08
+FIT_MAX_RATIO = 0.9
+FIT_OPS = {"pane.fit": "fit_pane", "pane.unfit": "unfit_pane", "pane.unfitAll": "unfit_all"}
+# NOTE: a killed phone stops its heartbeat; the poller reaps fits older
+# than this even when no client ever attaches again.
+FIT_TTL_MS = 5 * 60 * 1000
+NOTICE_RE = re.compile(r"[A-Za-z0-9 .,:\-()]{1,120}")
+NOTICE_MARKER = "PHONE VIEW - NARROWED TO"
+NOTICE_LINE_RE = re.compile(r"PHONE VIEW - NARROWED TO \d+ COLS - RESTORES WHEN YOU LEAVE")
+
+
+def fit_sides(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS fit_sides (
+        session TEXT NOT NULL, tab_id TEXT NOT NULL, side_pane TEXT NOT NULL,
+        at INTEGER NOT NULL, PRIMARY KEY(session, tab_id))""")
+
+
+def tab_of_pane(pane_id):
+    # NOTE: the poller cache lags the desktop by seconds; tab decisions
+    # read the live layout first so a fast tab switch cannot mis-record
+    # a split or phantom-release it.
+    live = live_pane_map()
+    if live is not None:
+        tab = live.get(pane_id)
+        if tab:
+            return tab
+    for pane in current_snapshot()["panes"]:
+        if pane.get("pane_id") == pane_id:
+            return pane.get("tab_id")
+    return None
+
+
+def tab_panes(tab_id):
+    return [p for p in current_snapshot()["panes"] if p.get("tab_id") == tab_id]
+
+
+def tab_area_width(tab_id):
+    for layout in current_snapshot().get("layouts", []):
+        if layout.get("tab_id") == tab_id:
+            area = layout.get("area", {})
+            if type(area.get("width")) in (int, float) and area["width"] > 0:
+                return area["width"]
+    return None
+
+
+def read_width(pane_id):
+    # NOTE: recent (not unwrapped) wraps at the live pty width, so the
+    # longest visual line approximates the pane's column count.
+    try:
+        out = run_cli(["--session", SESSION, "pane", "read", pane_id,
+                       "--source", "recent", "--lines", "20",
+                       "--format", "text"], timeout=12, max_bytes=256 * 1024)
+        if out.returncode != 0:
+            return -1
+        return max([len(line) for line in out.stdout.decode("utf-8", errors="replace").splitlines()] or [0])
+    except (OSError, subprocess.TimeoutExpired, OutputLimitError):
+        return -1
+
+
+def notice_text(cols):
+    text = "%s %d COLS - RESTORES WHEN YOU LEAVE" % (NOTICE_MARKER, cols)
+    if not NOTICE_RE.fullmatch(text):
+        raise ValueError("invalid notice text")
+    return text
+
+
+def pane_snippet(pane_id, lines=6):
+    try:
+        out = run_cli(["--session", SESSION, "pane", "read", pane_id,
+                       "--source", "recent-unwrapped", "--lines", str(lines),
+                       "--format", "text"], timeout=12, max_bytes=64 * 1024)
+        return out.stdout.decode("utf-8", errors="replace") if out.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired, OutputLimitError, ValueError):
+        return ""
+
+
+def sweep_notice_orphans():
+    # NOTE: records can be lost across a crash or reinstall, leaving a
+    # notice panel no record points at. The notice line itself identifies
+    # our panels. A tab always keeps its last pane, so a lone pane is
+    # never closed even if it echoes the marker.
+    live = live_pane_map()
+    if not live:
+        return [], []
+    recorded = {side for _, side in all_fit_sides()}
+    by_tab = {}
+    for pane, tab in live.items():
+        by_tab.setdefault(tab, []).append(pane)
+    released, failed = [], []
+    for panes in by_tab.values():
+        remaining = list(panes)
+        for pane in panes:
+            if len(remaining) < 2:
+                break
+            if pane in recorded:
+                continue
+            if not NOTICE_LINE_RE.search(pane_snippet(pane)):
+                continue
+            if close_side(pane, attempts=2):
+                remaining.remove(pane)
+                released.append(pane)
+            else:
+                failed.append(pane)
+    return released, failed
+
+
+def touch_fit(pane_id):
+    # NOTE: heartbeats never fail the client; a missed beat just lets
+    # the record age toward the reap below.
+    tab = tab_of_pane(pane_id)
+    if not tab:
+        return False
+    with STORE.connect() as db:
+        fit_sides(db)
+        row = db.execute("SELECT side_pane FROM fit_sides WHERE session=? AND tab_id=?",
+                         (SESSION, tab)).fetchone()
+        if not row:
+            return False
+        db.execute("UPDATE fit_sides SET at=? WHERE session=? AND tab_id=?",
+                   (now_ms(), SESSION, tab))
+    return True
+
+
+def reap_stale_fits(ttl_ms):
+    # NOTE: a killed phone never sends unfit, so the poller reaps fits
+    # whose heartbeat stopped over ttl_ms ago. Only recorded sides close
+    # here, so a user's own splits are never at risk.
+    try:
+        ttl = int(ttl_ms)
+    except (TypeError, ValueError):
+        return [], []
+    cutoff = now_ms() - max(ttl, 0)
+    with STORE.connect() as db:
+        fit_sides(db)
+        rows = db.execute("SELECT session, tab_id, side_pane FROM fit_sides WHERE at < ?",
+                          (cutoff,)).fetchall()
+    released, failed = [], []
+    for session, tab, side in rows:
+        live = live_pane_map(session=session)
+        if live is not None and side not in live:
+            forget_fit_side(tab_id=tab, session=session)
+            released.append(side)
+        elif close_side(side, attempts=2, session=session):
+            forget_fit_side(tab_id=tab, session=session)
+            released.append(side)
+        else:
+            failed.append(side)
+    return released, failed
+
+
+def close_side(side_pane, attempts=1, session=None):
+    for _ in range(max(attempts, 1)):
+        try:
+            if not cli_error(run_cli(["--session", session or SESSION, "pane", "close", side_pane], timeout=15)):
+                return True
+        except (OSError, subprocess.TimeoutExpired, OutputLimitError):
+            pass
+        time.sleep(2)
+    return False
+
+
+def all_fit_sides():
+    with STORE.connect() as db:
+        fit_sides(db)
+        return db.execute("SELECT tab_id, side_pane FROM fit_sides WHERE session=?",
+                          (SESSION,)).fetchall()
+
+
+def forget_fit_side(tab_id=None, side_pane=None, session=None):
+    session = session or SESSION
+    with STORE.connect() as db:
+        fit_sides(db)
+        if tab_id is not None:
+            db.execute("DELETE FROM fit_sides WHERE session=? AND tab_id=?", (session, tab_id))
+        else:
+            db.execute("DELETE FROM fit_sides WHERE session=? AND side_pane=?", (session, side_pane))
+
+
+NOTICE_COMMAND = ["powershell", "-NoProfile", "-Command"]
+
+
+def live_pane_map(session=None):
+    # NOTE: the poller cache lags the desktop by seconds, so split/close
+    # decisions read the live layout; pane list is cheap.
+    try:
+        out = run_cli(["--session", session or SESSION, "pane", "list"], timeout=15)
+        if cli_error(out):
+            return None
+        panes = json.loads(out.stdout).get("result", {}).get("panes", [])
+        live = {p.get("pane_id"): p.get("tab_id") for p in panes
+                if p.get("pane_id") and p.get("tab_id")}
+        return live or None
+    except (OSError, subprocess.TimeoutExpired, OutputLimitError, ValueError):
+        return None
+
+
+def tab_panes_now(tab_id):
+    live = live_pane_map()
+    if live is not None:
+        return [p for p, t in live.items() if t == tab_id]
+    return tab_panes(tab_id)
+
+
+def sweep_gone_sides():
+    # NOTE: only tabs visibly gone lose their records. A side pane created
+    # seconds ago is missing from the lagging cache, but its tab is old;
+    # dropping by side would orphan live panels.
+    with STORE.connect() as db:
+        fit_sides(db)
+        try:
+            tabs = sorted({t.get("tab_id") for t in current_snapshot().get("tabs", []) if t.get("tab_id")})
+        except ValueError:
+            return
+        if tabs:
+            db.execute("DELETE FROM fit_sides WHERE session=? AND tab_id NOT IN (%s)" % ",".join("?" * len(tabs)),
+                       [SESSION] + tabs)
+
+
+def fit_pane(request_id, payload, kind):
+    canonical = FIT_OPS[kind]
+    key = payload.get("idempotencyKey") or request_id
+    identity = {"paneId": payload.get("paneId"), "operation": canonical}
+    if canonical == "fit_pane":
+        identity["cols"] = payload.get("cols")
+    side_created = None
+    try:
+        claimed, previous = STORE.claim(SESSION, key, identity)
+        if not claimed:
+            send("ack", {"duplicate": True}, in_reply_to=request_id)
+            send("command.result", previous, in_reply_to=request_id)
+            return
+        sweep_gone_sides()
+        if canonical == "unfit_all" and payload.get("staleOlderThanMs") is not None:
+            # NOTE: the poller's periodic reap; read-free, records only.
+            released, failed = reap_stale_fits(payload["staleOlderThanMs"])
+            result = {"ok": not failed, "released": released, "failed": failed}
+            if failed:
+                result["error"] = "a notice panel resisted closing; not repeated"
+            STORE.finish(SESSION, key, result)
+            send("ack", {"duplicate": False}, in_reply_to=request_id)
+            send("command.result", result, in_reply_to=request_id)
+            return
+        if canonical == "unfit_all":
+            released, failed = [], []
+            live = live_pane_map()
+            for _, side in all_fit_sides():
+                if live is not None and side not in live:
+                    forget_fit_side(side_pane=side)
+                    released.append(side)
+                elif close_side(side, attempts=2):
+                    forget_fit_side(side_pane=side)
+                    released.append(side)
+                else:
+                    failed.append(side)
+            orphans, orphan_failed = sweep_notice_orphans()
+            released.extend(orphans)
+            failed.extend(orphan_failed)
+            result = {"ok": not failed, "released": released, "failed": failed}
+            if failed:
+                result["error"] = "a notice panel resisted closing; not repeated"
+            STORE.finish(SESSION, key, result)
+            send("ack", {"duplicate": False}, in_reply_to=request_id)
+            send("command.result", result, in_reply_to=request_id)
+            return
+        pane = payload["paneId"]
+        cols = payload["cols"] if canonical == "fit_pane" else None
+        require_pane(pane, must_exist=(canonical == "fit_pane"))
+        tab = tab_of_pane(pane)
+        if not tab:
+            if canonical == "unfit_pane":
+                # NOTE: the pane (and probably its tab) is already gone;
+                # there is nothing left to release.
+                result = {"ok": True, "released": False}
+                STORE.finish(SESSION, key, result)
+                send("ack", {"duplicate": False}, in_reply_to=request_id)
+                send("command.result", result, in_reply_to=request_id)
+                return
+            raise ValueError("pane has no tab in the selected session")
+        stale_released = False
+        with STORE.connect() as db:
+            fit_sides(db)
+            stale = db.execute("SELECT side_pane FROM fit_sides WHERE session=? AND tab_id=?",
+                               (SESSION, tab)).fetchone()
+            if stale:
+                # NOTE: a side already gone needs no close; a stuck close
+                # keeps its record so the next unfit retries it.
+                live = live_pane_map()
+                if live is not None and stale[0] not in live:
+                    db.execute("DELETE FROM fit_sides WHERE session=? AND tab_id=?", (SESSION, tab))
+                    stale_released = True
+                elif close_side(stale[0], attempts=3):
+                    db.execute("DELETE FROM fit_sides WHERE session=? AND tab_id=?", (SESSION, tab))
+                    stale_released = True
+                elif canonical == "fit_pane":
+                    raise ValueError("previous notice panel is stuck; not repeated")
+        if canonical == "unfit_pane":
+            if stale and not stale_released:
+                result = {"ok": False, "released": False,
+                          "error": "notice panel resisted closing; not repeated"}
+            else:
+                result = {"ok": True, "released": stale_released}
+            STORE.finish(SESSION, key, result)
+            send("ack", {"duplicate": False}, in_reply_to=request_id)
+            send("command.result", result, in_reply_to=request_id)
+            return
+        if len(tab_panes_now(tab)) != 1:
+            raise ValueError("tab already has splits; close them before fitting")
+        area = tab_area_width(tab)
+        if area:
+            ratio = (cols + 3) / area
+        else:
+            measured = read_width(pane)
+            ratio = (cols + 3) / (max(measured, FIT_MIN_COLS) + 3)
+        ratio = min(FIT_MAX_RATIO, max(FIT_MIN_RATIO, ratio))
+        out = run_cli(["--session", SESSION, "pane", "split", pane,
+                       "--direction", "right", "--ratio", str(round(ratio, 3))], timeout=15)
+        side = None
+        if not cli_error(out):
+            try:
+                side = json.loads(out.stdout).get("result", {}).get("pane", {}).get("pane_id")
+            except ValueError:
+                side = None
+            if not side:
+                # NOTE: split succeeded but its reply is unreadable; adopt
+                # the tab's only other pane instead of orphaning a split.
+                others = [p.get("pane_id") for p in tab_panes_now(tab) if p.get("pane_id") != pane]
+                side = others[0] if len(others) == 1 else None
+        if not side:
+            raise ValueError("Herdr rejected the split; not repeated")
+        side_created = side
+        with STORE.connect() as db:
+            fit_sides(db)
+            db.execute("INSERT OR REPLACE INTO fit_sides VALUES(?,?,?,?)", (SESSION, tab, side, now_ms()))
+        notice_cmd = (["--session", SESSION, "pane", "run", side] + NOTICE_COMMAND +
+                      ["Write-Host '%s'; while($true){Start-Sleep 86400}" % notice_text(cols)])
+        try:
+            # NOTE: a print-then-sleep loop, never a shell: keystrokes
+            # typed into the panel are ignored instead of executed.
+            ran_ok = not cli_error(run_cli(notice_cmd, timeout=15))
+            if not ran_ok:
+                time.sleep(2)
+                ran_ok = not cli_error(run_cli(notice_cmd, timeout=15))
+        except subprocess.TimeoutExpired:
+            ran_ok = True  # The notice spawn outlived the wait; the split itself is verifiable.
+        if not ran_ok:
+            raise ValueError("Herdr rejected the notice panel; not repeated")
+        result = {"ok": True, "sidePaneId": side, "ratio": round(ratio, 3), "width": read_width(pane)}
+    except subprocess.TimeoutExpired:
+        result = {"ok": False, "uncertain": True, "error": "command outcome unknown; not repeated"}
+    except (OSError, ValueError) as e:
+        if side_created:
+            # NOTE: only forget a panel Herdr confirms closed; a stuck
+            # close keeps its record so the next unfit retries it.
+            if close_side(side_created, attempts=3):
+                try:
+                    forget_fit_side(side_pane=side_created)
+                except (OSError, sqlite3.Error):
+                    pass
+        result = {"ok": False, "error": "command unavailable or target invalid; not repeated",
+                  "reason": "%s: %s" % (type(e).__name__, str(e)[:160])}
+    except sqlite3.Error:
+        if side_created:
+            close_side(side_created)
+        result = {"ok": False, "uncertain": True, "error": "command store unavailable; command not repeated"}
+    try:
+        STORE.finish(SESSION, key, result)
+    except (OSError, sqlite3.Error):
+        result = {"ok": False, "uncertain": True, "error": "command store unavailable; command not repeated"}
+    send("ack", {"duplicate": False}, in_reply_to=request_id)
+    send("command.result", result, in_reply_to=request_id)
 
 
 def mutation_commands(kind, payload):
@@ -251,7 +640,7 @@ def handle(env):
                          "selected": 1, "supported": [1]},
             "server": {"bridgeVersion": BRIDGE_VERSION,
                        "capabilities": ["snapshot", "timeline", "pane.read", "pane.sendText",
-                                        "pane.sendKeys", "close"],
+                                        "pane.sendKeys", "pane.fit", "pane.unfitAll", "pane.fitTouch", "pane.ansi", "close"],
                        "herdrProtocol": snap["protocol"], "herdrVersion": snap["version"],
                        "hostname": "localhost", "serverId": "localhost:" + SESSION}})
         send("connection.state", {"phase": "stale"}, top_seq=1)
@@ -260,6 +649,7 @@ def handle(env):
     elif kind == "timeline.subscribe":
         panes = payload.get("paneIds", [])
         active = payload.get("activePaneId") or (panes[0] if panes else None)
+        ansi = payload.get("ansi", False)
         if payload.get("active") and panes:
             for pane in set(panes + [active]):
                 require_pane(pane)
@@ -267,7 +657,7 @@ def handle(env):
         if payload.get("active") and panes:
             send("connection.state", {"phase": "stale"}, top_seq=1)
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-                texts = {pane: pool.submit(pane_text, pane, 400) for pane in dict.fromkeys(panes + [active])}
+                texts = {pane: pool.submit(pane_text, pane, 400, ansi) for pane in dict.fromkeys(panes + [active])}
             number = 2
             def emit(pane, delta=False):
                 nonlocal number
@@ -287,13 +677,19 @@ def handle(env):
     elif kind == "raw.read":
         pane = payload["paneId"]
         lines = payload.get("lines", 1000)
-        text = pane_text(pane, lines)
+        text = pane_text(pane, lines, payload.get("ansi", False))
         revision = next((p.get("revision", 0) for p in current_snapshot()["panes"]
                          if p.get("pane_id") == pane), 0)
         send("raw.read.result", {"paneId": pane, "revision": revision,
              "text": text, "truncated": len(text.splitlines()) >= lines}, in_reply_to=request_id)
     elif kind in MUTATIONS:
         mutate(kind, request_id, payload)
+    elif kind == "pane.fitTouch":
+        touched = touch_fit(payload["paneId"])
+        send("ack", {"duplicate": False}, in_reply_to=request_id)
+        send("command.result", {"ok": True, "touched": touched}, in_reply_to=request_id)
+    elif kind in FIT_OPS:
+        fit_pane(request_id, payload, kind)
     else:
         send("command.result", {"ok": False, "error": "unsupported request"}, in_reply_to=request_id)
 
