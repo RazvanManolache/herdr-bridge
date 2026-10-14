@@ -17,7 +17,9 @@ from bridge_common import HOME, discover_sessions, valid_session
 from pairing_store import PairingStore
 
 PAIR_HOME = HOME / 'paired'
-MAX_LINE = 8 * 1024 * 1024
+MAX_LINE = 128 * 1024
+# CLI text is capped at 2 MiB; JSON escaping can expand control characters sixfold.
+MAX_REPLY_LINE = 16 * 1024 * 1024
 # Optional dependencies live inside the protected bridge installation, not a user-site import path.
 if (HOME / 'paired-runtime').is_dir():
     sys.path.insert(0, str(HOME / 'paired-runtime'))
@@ -203,8 +205,8 @@ class PairHandler(socketserver.BaseRequestHandler):
                     def output():
                         try:
                             while not done.is_set():
-                                line = proc.stdout.readline(8 * 1024 * 1024 + 1)
-                                if not line or len(line) > 8 * 1024 * 1024: break
+                                line = proc.stdout.readline(MAX_REPLY_LINE + 1)
+                                if not line or len(line) > MAX_REPLY_LINE: break
                                 outgoing.write(line)
                                 outgoing.flush()
                         except (OSError, ValueError):

@@ -144,3 +144,12 @@ SSH installer already restarts its poller during an update.
 
 The work PC's actual port/firewall path and physical-phone QR scanning remain
 separate installation checks. Tests here do not claim those were exercised.
+
+## Deeper history in bridge 0.3.3
+
+Herdr on the Go 0.2.3 can keep requesting older output beyond the previous
+2,000-line ceiling. Update the PC responder to **0.3.3** and reconnect the app.
+Each CLI history read is still capped at 2 MiB and depends on the scrollback
+Herdr retains. Paired replies allow up to 16 MiB to accommodate escaped JSON;
+the incoming request limit remains 128 KiB. Available scrollback and these
+byte budgets determine how much history a read can return.

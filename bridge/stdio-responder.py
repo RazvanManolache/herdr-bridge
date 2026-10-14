@@ -12,7 +12,7 @@ from bridge_common import (HOME, OutputLimitError, discover_sessions, log,
                            now_ms, run_cli, session_cache, valid_session)
 from command_store import CommandStore
 
-BRIDGE_VERSION = "0.3.2"
+BRIDGE_VERSION = "0.3.3"
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 128 * 1024
 MAX_PANES = 64

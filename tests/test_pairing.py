@@ -179,6 +179,33 @@ class TlsTests(unittest.TestCase):
     def test_certificate_identity_is_stable(self):
         self.assertEqual(self.fingerprint, paired_server.identity(self.home)[2])
 
+    def test_large_escaped_history_reply_does_not_close_stream(self):
+        responder = self.home / 'large-reply.py'
+        responder.write_text('import json,sys\nfor line in sys.stdin:\n'
+            ' print(json.dumps({"text":"\\x01"*(1536*1024)}),flush=True)\n')
+        self.server.responder = responder
+        self.store.open_window(); secret = secrets.token_urlsafe(32)
+        request = self.store.start('History phone', 'fixture', secret)
+        self.assertTrue(self.store.approve(request['requestId'], request['code']))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
+        with socket.create_connection(self.server.server_address, timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname='fixture') as tls:
+                self.assertEqual(self.fingerprint, hashlib.sha256(tls.getpeercert(True)).hexdigest())
+                tls.settimeout(15)
+                tls.sendall(json.dumps({'op': 'stdio', 'deviceId': request['requestId'],
+                    'secret': secret, 'session': 'fixture'}).encode() + b'\n')
+                with tls.makefile('rb') as incoming:
+                    self.assertTrue(json.loads(incoming.readline())['ok'])
+                    for _ in range(2):
+                        tls.sendall(b'{"sessionId":"fixture","type":"raw.read"}\n')
+                        line = incoming.readline(paired_server.MAX_REPLY_LINE + 1)
+                        self.assertGreater(len(line), 8 * 1024 * 1024)
+                        self.assertEqual(1536 * 1024, len(json.loads(line)['text']))
+
+    def test_request_budget_remains_small_when_replies_grow(self):
+        self.assertEqual(128 * 1024, paired_server.MAX_LINE)
+
     def test_authenticated_idle_stream_survives_one_minute_and_revokes(self):
         responder = self.home / 'echo.py'
         responder.write_text('import sys\nfor line in sys.stdin:\n sys.stdout.write(line); sys.stdout.flush()\n')

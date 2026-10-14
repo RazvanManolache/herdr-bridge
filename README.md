@@ -35,7 +35,7 @@ Optional dependency terms are recorded in [the notices](THIRD_PARTY_NOTICES.md).
 | --- | --- |
 | Windows | Windows x64 with Windows OpenSSH Server |
 | Herdr | **0.9.3**, Windows x64 standalone release; snapshot protocol **22** |
-| Bridge identity | Reports `herdr-mobile-bridge 0.3.2`; JSONL envelope version **1** |
+| Bridge identity | Reports `herdr-mobile-bridge 0.3.3`; JSONL envelope version **1** |
 | Python | Python 3 with standard-library SQLite; verified with **3.14.7** |
 | Git for Windows | Full installation containing `bin/sh.exe` and `usr/bin/perl.exe` |
 | Build tools | Visual Studio / Build Tools with **Desktop development with C++**, MSVC x64 tools, and a Windows SDK |
@@ -291,7 +291,7 @@ $bridgeShell = Join-Path $env:USERPROFILE '.herdr-bridge-emu\sh-log.exe'
 & $bridgeShell -c '[ -S "$HOME/.config/herdr/herdr.sock" ] && echo keeper-ready'
 ```
 
-Expect `herdr-mobile-bridge 0.3.2`, a JSON array of running sessions, and
+Expect `herdr-mobile-bridge 0.3.3`, a JSON array of running sessions, and
 `keeper-ready`. An empty array means no running sessions were discovered.
 
 ### Real CLI integration check
@@ -421,13 +421,14 @@ not silently discard unresolved reservations to make room. Legacy
 
 | Resource | Limit |
 | --- | --- |
-| JSONL frame | 128 KiB; oversized frames close the connection |
+| Incoming JSONL frame | 128 KiB; oversized requests close the connection |
+| Paired reply frame | 16 MiB, including JSON escaping |
 | Discovered sessions | 32 |
 | Panes per subscription | 64 |
 | Concurrent pane-read workers | 4 per responder |
-| Requested lines | 2,000 per read |
+| Requested lines | Positive counts; available scrollback and captured-output budget apply |
 | Send text / keys | 12,000 characters / 32 keys per operation |
-| Captured pane output | 512 KiB |
+| Captured pane output | 2 MiB per read |
 | Ordinary CLI stdout/stderr | 2 MiB per stream |
 | Snapshot capture / total cache file | 16 MiB |
 | Accepted snapshot age | 60 seconds |
