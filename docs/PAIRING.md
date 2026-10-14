@@ -117,5 +117,30 @@ Android's `tests/paired_bridge_check.py` verifies the TLS client, rotation,
 encrypted credentials, real Herdr command/readback, wrong-pin rejection, and
 active revocation on an explicit fresh emulator.
 
+## Upgrade for phone-width fitting
+
+Herdr on the Go 0.2.2 uses bridge **0.3.2** for terminal colors, phone-width
+fitting, and cleanup of abandoned notice panes. Re-run the paired installer with
+your existing listen address and port, then reconnect the app. The certificate
+and device approvals are retained.
+
+An existing snapshot poller is reused by the paired installer. Restart it to
+load the new five-minute cleanup; otherwise the old process keeps its old code.
+Signing out of Windows and back in starts the updated logon processes. To restart
+only the current user's bridge poller without signing out, use:
+
+```powershell
+$bridgeDirectory = Join-Path $env:USERPROFILE '.herdr-bridge-emu'
+$pollerPath = Join-Path $bridgeDirectory 'snapshot-poller.py'
+Get-CimInstance Win32_Process | Where-Object {
+    $_.Name -eq 'python.exe' -and $_.CommandLine -and $_.CommandLine.Contains($pollerPath)
+} | ForEach-Object { Stop-Process -Id $_.ProcessId }
+Start-Process -FilePath 'C:\path\to\python.exe' -ArgumentList @('-E', '-s', '-u', "`"$pollerPath`"") -WindowStyle Hidden
+```
+
+Replace the Python path with the same executable used for installation. This
+restarts the snapshot refresher, not the Herdr sessions or terminals. The normal
+SSH installer already restarts its poller during an update.
+
 The work PC's actual port/firewall path and physical-phone QR scanning remain
 separate installation checks. Tests here do not claim those were exercised.

@@ -9,7 +9,7 @@ This is an unofficial, single-user adapter using the real Herdr CLI, Windows
 OpenSSH, a small native shell wrapper, and Python's standard library. It
 implements a subset of the mobile bridge protocol.
 
-The current development source also adds an optional **paired TLS connection**:
+The bridge also supports an optional **paired TLS connection**:
 approve a phone inside Herdr using its displayed code, without Windows login
 credentials. SSH remains supported. See the [pairing installation and use guide](docs/PAIRING.md).
 The paired-only installer requires no OpenSSH, Git, or C++ build tools.
@@ -35,7 +35,7 @@ Optional dependency terms are recorded in [the notices](THIRD_PARTY_NOTICES.md).
 | --- | --- |
 | Windows | Windows x64 with Windows OpenSSH Server |
 | Herdr | **0.9.3**, Windows x64 standalone release; snapshot protocol **22** |
-| Bridge identity | Reports `herdr-mobile-bridge 0.3.1`; JSONL envelope version **1** |
+| Bridge identity | Reports `herdr-mobile-bridge 0.3.2`; JSONL envelope version **1** |
 | Python | Python 3 with standard-library SQLite; verified with **3.14.7** |
 | Git for Windows | Full installation containing `bin/sh.exe` and `usr/bin/perl.exe` |
 | Build tools | Visual Studio / Build Tools with **Desktop development with C++**, MSVC x64 tools, and a Windows SDK |
@@ -291,7 +291,7 @@ $bridgeShell = Join-Path $env:USERPROFILE '.herdr-bridge-emu\sh-log.exe'
 & $bridgeShell -c '[ -S "$HOME/.config/herdr/herdr.sock" ] && echo keeper-ready'
 ```
 
-Expect `herdr-mobile-bridge 0.3.1`, a JSON array of running sessions, and
+Expect `herdr-mobile-bridge 0.3.2`, a JSON array of running sessions, and
 `keeper-ready`. An empty array means no running sessions were discovered.
 
 ### Real CLI integration check
