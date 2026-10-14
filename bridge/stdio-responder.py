@@ -17,7 +17,6 @@ PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 128 * 1024
 MAX_PANES = 64
 MAX_WORKERS = 4
-MAX_READ_LINES = 2000
 MAX_TEXT_CHARS = 12000
 SESSION = "default"
 STORE = CommandStore()
@@ -76,8 +75,8 @@ def validate(env):
             raise ValueError("staleOlderThanMs must be 60000..86400000")
     if kind == "raw.read":
         lines = payload.get("lines", 1000)
-        if type(lines) is not int or not 1 <= lines <= MAX_READ_LINES:
-            raise ValueError("lines must be between 1 and 2000")
+        if type(lines) is not int or lines < 1:
+            raise ValueError("lines must be positive")
         if type(payload.get("ansi", False)) is not bool:
             raise ValueError("invalid ansi flag")
     if kind == "pane.fit":
@@ -136,7 +135,7 @@ def pane_text(pane_id, lines, ansi=False):
     try:
         out = run_cli(["--session", SESSION, "pane", "read", pane_id,
                        "--source", "recent-unwrapped", "--lines", str(lines),
-                       "--format", "ansi" if ansi else "text"], timeout=12, max_bytes=512 * 1024)
+                       "--format", "ansi" if ansi else "text"], timeout=12, max_bytes=2 * 1024 * 1024)
         return out.stdout.decode("utf-8", errors="replace") if out.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired, OutputLimitError):
         log("pane_read_failed")

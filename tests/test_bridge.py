@@ -204,12 +204,25 @@ class BridgeTests(unittest.TestCase):
 
     def test_resource_limits_reject_before_cli(self):
         bad = [self.request(text="x" * (self.m.MAX_TEXT_CHARS + 1)),
-               {"type": "raw.read", "payload": {"paneId": "w1:p1", "lines": 999999}},
+               {"type": "raw.read", "payload": {"paneId": "w1:p1", "lines": 0}},
                {"type": "timeline.subscribe", "payload": {"active": True, "paneIds": ["p%d" % i for i in range(1000)]}}]
         for request in bad:
             with self.assertRaises(ValueError):
                 self.m.handle(request)
         self.assertEqual(self.calls, [])
+
+    def test_deep_history_read_accepts_large_line_counts(self):
+        real_text = self.m.pane_text
+        self.m.pane_text = lambda *args: "terminal"
+        try:
+            self.m.handle({"type": "raw.read", "id": "r-deep", "sessionId": "default",
+                           "payload": {"paneId": "w1:p1", "lines": 5000}})
+        finally:
+            self.m.pane_text = real_text
+        results = [p for kind, p, _ in self.frames if kind == "raw.read.result"]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["text"], "terminal")
+        self.assertFalse(results[0]["truncated"])
 
     def test_timeline_wire_order_and_fixed_worker_count(self):
         self.m.pane_text = lambda *args: "terminal"
