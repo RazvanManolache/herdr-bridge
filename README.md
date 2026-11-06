@@ -1,5 +1,11 @@
 # herdr-bridge for Windows
 
+## Build on GitHub
+
+Open [Actions](https://github.com/RazvanManolache/herdr-bridge/actions/workflows/build.yml), choose **Run workflow**, and select the branch. Builds also run on pushes and pull requests. Open a successful run and download its **Artifacts** (GitHub sign-in required; retained for 30 days).
+
+The download contains the source, installation scripts, documentation, and a prebuilt `build/sh-log.exe`. Extract it and follow the installation instructions below; compiling the wrapper is no longer necessary. Python, Herdr, and (for SSH mode) Git/OpenSSH remain prerequisites. CI runs offline bridge and TLS pairing tests, without changing SSH settings or installing the bridge.
+
 A Windows adapter for the Herdr Mobile SSH bridge protocol. Connect a compatible
 mobile client to an existing Windows Herdr session to view panes, read terminal
 output, send text or keys, and close workspaces. No WSL, Docker, Python packages,
